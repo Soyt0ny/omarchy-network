@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+umask 077
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/network"
+ALIAS_FILE="$CONFIG_DIR/interfaces.tsv"
+
+fail() { printf '%s\n' "$*" >&2; exit 1; }
+usage() { fail "usage: wifi-helper {list|alias get ID|alias set ID ALIAS|disconnect IFACE|connect IFACE [SSID]|mode get IFACE|mode set IFACE managed|mode set IFACE monitor}"; }
+valid_iface() { [[ "$1" =~ ^[[:alnum:]_.:-]+$ ]]; }
+valid_identity() { [[ "$1" =~ ^[[:alnum:]_.:-]+$ ]]; }
+clean_field() { printf '%s' "$1" | tr '\t\r\n' '   '; }
+
+require_iface() {
+  valid_iface "$1" || fail "invalid interface name"
+  [[ -d "/sys/class/net/$1" ]] || fail "interface not found: $1"
+}
+
+# Permanent hardware address is preferred; interface name is the documented
+# fallback for devices that do not expose one through NetworkManager.
+identity_for() {
+  local iface=$1 value
+  value=$(nmcli -g GENERAL.PERM-HW-ADDRESS device show "$iface" 2>/dev/null | head -n1 || true)
+  if [[ -z "$value" || "$value" == "--" ]]; then
+    value=$(nmcli -g GENERAL.HWADDR device show "$iface" 2>/dev/null | head -n1 || true)
+  fi
+  value=${value//\\:/\:}
+  value=${value//\\\\/\\}
+  value=${value^^}
+  [[ -n "$value" && "$value" != "--" ]] || value=$iface
+  printf '%s' "$value"
+}
+
+alias_for() {
+  local identity=$1 value=""
+  valid_identity "$identity" || fail "invalid identity"
+  [[ -r "$ALIAS_FILE" ]] || { printf '%s' "$identity"; return; }
+  value=$(awk -F '\t' -v key="$identity" '$1 == key { print substr($0, index($0, FS) + 1); exit }' "$ALIAS_FILE")
+  printf '%s' "${value:-$identity}"
+}
+
+set_alias() {
+  local identity=$1 alias=$2 tmp
+  valid_identity "$identity" || fail "invalid identity"
+  [[ -n "$alias" ]] || fail "alias must not be empty"
+  [[ "$alias" != *$'\t'* && "$alias" != *$'\n'* && "$alias" != *$'\r'* ]] || fail "alias contains a forbidden control character"
+  mkdir -p -m 700 "$CONFIG_DIR"
+  touch "$ALIAS_FILE"
+  chmod 600 "$ALIAS_FILE"
+  tmp=$(mktemp "$CONFIG_DIR/.interfaces.tsv.XXXXXX")
+  trap 'rm -f "$tmp"' EXIT
+  awk -F '\t' -v key="$identity" '$1 != key { print }' "$ALIAS_FILE" > "$tmp"
+  printf '%s\t%s\n' "$identity" "$alias" >> "$tmp"
+  chmod 600 "$tmp"
+  mv -f -- "$tmp" "$ALIAS_FILE"
+  trap - EXIT
+}
+
+udev_value() {
+  local iface=$1 key=$2 path props
+  path=$(readlink -f "/sys/class/net/$iface/device" 2>/dev/null || true)
+  [[ -n "$path" && -e "$path" ]] || return 0
+  props=$(udevadm info --query=property --path="${path#/sys}" 2>/dev/null || true)
+  awk -F= -v key="$key" '$1 == key { print substr($0, index($0, "=") + 1); exit }' <<< "$props"
+}
+
+driver_for() {
+  basename "$(readlink -f "/sys/class/net/$1/device/driver" 2>/dev/null || true)"
+}
+
+model_for() {
+  local value
+  value=$(udev_value "$1" ID_MODEL_FROM_DATABASE)
+  [[ -n "$value" ]] || value=$(udev_value "$1" ID_MODEL)
+  [[ -n "$value" ]] || value=$(udev_value "$1" PRODUCT)
+  clean_field "$value"
+}
+
+eligible_for() {
+  local iface=$1 driver vendor product model
+  driver=$(driver_for "$iface")
+  vendor=$(udev_value "$iface" ID_VENDOR_ID)
+  product=$(udev_value "$iface" ID_MODEL_ID)
+  model=$(model_for "$iface")
+  [[ "$driver" == rtl8188eu || "$driver" == rtl8xxxu ]] || return 1
+  if [[ "$vendor" == 2357 && "$product" =~ ^(010c|010d|010e|010f|011e|0138)$ ]]; then return 0; fi
+  [[ "$model" =~ (TL[-_ ]?WN722N|RTL8188EUS) ]] || return 1
+}
+
+mode_for() {
+  local iface=$1 mode
+  mode=$(iw dev "$iface" info 2>/dev/null | awk '$1 == "type" { print $2; exit }' || true)
+  printf '%s' "${mode:-managed}"
+}
+
+list_interfaces() {
+  local iface type state identity alias eligible mode model driver
+  while IFS=: read -r iface type state _; do
+    [[ "$type" == wifi ]] || continue
+    [[ -n "$iface" ]] || continue
+    identity=$(identity_for "$iface")
+    model=$(model_for "$iface")
+    alias=$(alias_for "$identity")
+    if [[ "$alias" == "$identity" ]]; then
+      alias=${model:-"Wi-Fi adapter"}
+    fi
+    driver=$(driver_for "$iface")
+    eligible=0
+    eligible_for "$iface" && eligible=1 || true
+    mode=$(mode_for "$iface")
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$iface" "$identity" "$(clean_field "$alias")" "$(clean_field "$state")" \
+      "$eligible" "$mode" "$model" "$driver"
+  done < <(nmcli -t -f DEVICE,TYPE,STATE device status)
+}
+
+case "${1:-}" in
+  list) list_interfaces ;;
+  alias)
+    [[ $# -ge 3 ]] || usage
+    case "$2" in
+      get) alias_for "$3" ;;
+      set) [[ $# -eq 4 ]] || usage; set_alias "$3" "$4"; printf '%s\n' "$4" ;;
+      *) usage ;;
+    esac
+    ;;
+  disconnect)
+    [[ $# -eq 2 ]] || usage
+    require_iface "$2"
+    # Prevent NetworkManager from immediately reactivating this interface.
+    nmcli device set "$2" autoconnect no
+    nmcli device disconnect "$2"
+    ;;
+  connect)
+    [[ $# -ge 2 && $# -le 3 ]] || usage
+    require_iface "$2"
+    nmcli device set "$2" autoconnect yes
+    if [[ $# -eq 3 ]]; then
+      [[ -n "$3" ]] || fail "SSID must not be empty"
+      nmcli device wifi connect "$3" ifname "$2"
+    else
+      uuid=$(nmcli -t -f UUID,TYPE,DEVICE connection show | awk -F: -v iface="$2" '$2 == "802-11-wireless" && $3 == iface { print $1; exit }')
+      [[ -n "$uuid" ]] || fail "no saved Wi-Fi profile for interface: $2"
+      nmcli connection up uuid "$uuid" ifname "$2"
+    fi
+    ;;
+  mode)
+    [[ $# -ge 3 ]] || usage
+    require_iface "$3"
+    eligible_for "$3" || fail "monitor mode is not supported for this adapter"
+    case "$2" in
+      get) mode_for "$3" ;;
+      set)
+        [[ $# -eq 4 ]] || usage
+        [[ "$4" == managed || "$4" == monitor ]] || fail "unsupported mode: $4"
+        if [[ "$4" == monitor ]]; then
+          state=$(nmcli -g GENERAL.STATE device show "$3" 2>/dev/null | head -n1 || true)
+          [[ -n "$state" ]] || fail "could not determine NetworkManager state for $3"
+          # Prevent NetworkManager from racing the iw mode transition. A
+          # connected device is reported as "100 (connected)".
+          nmcli device set "$3" autoconnect no
+          if [[ "$state" != 30* && "$state" != 20* ]]; then
+            nmcli device disconnect "$3" >/dev/null
+          fi
+          # NetworkManager can release the connection while the netdev is
+          # still up. Bring the interface down before changing its type.
+          pkexec ip link set dev "$3" down
+          pkexec iw dev "$3" set type monitor
+          pkexec ip link set dev "$3" up
+        else
+          pkexec ip link set dev "$3" down
+          pkexec iw dev "$3" set type managed
+          pkexec ip link set dev "$3" up
+          nmcli device set "$3" autoconnect yes
+          uuid=$(nmcli -t -f UUID,TYPE,DEVICE connection show | awk -F: -v iface="$3" '$2 == "802-11-wireless" && $3 == iface { print $1; exit }')
+          [[ -n "$uuid" ]] || fail "no saved Wi-Fi profile for interface: $3"
+          nmcli connection up uuid "$uuid" ifname "$3"
+        fi
+        mode_for "$3"
+        ;;
+      *) usage ;;
+    esac
+    ;;
+  *) usage ;;
+esac
